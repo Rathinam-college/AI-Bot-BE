@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
@@ -13,7 +14,6 @@ from database.db import (
     resolve_db_path,
 )
 
-load_dotenv()
 logger = logging.getLogger("ai_engine")
 
 
@@ -26,7 +26,72 @@ class AIEngine:
     """
 
     def __init__(self):
+        self.load_environment()
         self.model_name = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
+
+    @staticmethod
+    def _mask_key(key: str) -> str:
+        """Safely mask API key for logging without exposing secret credentials."""
+        if not key:
+            return "<none>"
+        clean = key.strip()
+        if len(clean) <= 8:
+            return "***"
+        return f"{clean[:4]}...{clean[-4:]}"
+
+    @classmethod
+    def load_environment(cls) -> None:
+        """
+        Search and load .env from multiple candidate paths to guarantee
+        environment variables are discovered in production, systemd services,
+        Docker containers, or local dev environments.
+        """
+        candidate_paths = [
+            Path(__file__).resolve().parent.parent / ".env",        # AI-Bot-BE/.env
+            Path(__file__).resolve().parent.parent.parent / ".env", # chatbot/.env
+            Path.cwd() / ".env",                                    # CWD/.env
+            Path.cwd() / "AI-Bot-BE" / ".env",
+        ]
+        for p in candidate_paths:
+            try:
+                if p.is_file():
+                    load_dotenv(dotenv_path=p, override=False)
+            except Exception:
+                pass
+        load_dotenv(override=False)
+
+    def _get_api_key(self) -> Tuple[str, str]:
+        """
+        Retrieve Gemini API key checking GEMINI_API_KEY, GOOGLE_API_KEY, and GOOGLE_GENAI_API_KEY.
+        Returns tuple (api_key, var_name).
+        """
+        self.load_environment()
+        for var_name in ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY"]:
+            val = os.getenv(var_name, "").strip()
+            if val:
+                return val, var_name
+        return "", ""
+
+    def get_candidate_models(self) -> List[str]:
+        """
+        Return ordered, deduplicated candidate models list.
+        Prioritizes user configured model and active Google Gemini models.
+        """
+        configured = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest").strip()
+        defaults = [
+            configured,
+            "gemini-flash-lite-latest",
+            "gemini-flash-lite-latest",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-1.5-flash",
+        ]
+        candidates = []
+        for m in defaults:
+            if m and m not in candidates:
+                candidates.append(m)
+        return candidates
 
     def refresh_context(self) -> None:
         """
@@ -41,10 +106,12 @@ class AIEngine:
 
     def _get_client(self):
         """Initialize Google GenAI client if API key is provided."""
-        load_dotenv()
-        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        api_key, var_name = self._get_api_key()
         if not api_key:
+            logger.info("[GEMINI INIT] No Gemini API key detected in GEMINI_API_KEY, GOOGLE_API_KEY, or GOOGLE_GENAI_API_KEY. Local SQLite grounding mode active.")
             return None
+        masked = self._mask_key(api_key)
+        logger.info(f"[GEMINI INIT] Initializing Google GenAI Client using key from '{var_name}' ({masked}).")
         try:
             from google import genai
             from google.genai import types
@@ -53,7 +120,7 @@ class AIEngine:
                 http_options=types.HttpOptions(timeout=30000),
             )
         except Exception as exc:
-            logger.warning(f"Could not initialize google-genai client: {exc}")
+            logger.error(f"[GEMINI INIT ERROR] Could not initialize google-genai client ({type(exc).__name__}): {exc}")
             return None
 
     def is_record_entry_request(self, message: str) -> bool:
@@ -81,17 +148,7 @@ class AIEngine:
         Uses GenAI if available, with heuristic fallback.
         """
         client = self._get_client()
-        configured_model = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest").strip()
-        candidate_models = [
-            configured_model,
-            "gemini-flash-lite-latest",
-            "gemini-3.8-flash",
-            "gemini-3.5-flash",
-            "gemini-3.5-flash-lite",
-            "gemini-3.1-flash-lite",
-            "gemini-flash-latest",
-        ]
-        models_to_try = [m for m in candidate_models if m]
+        models_to_try = self.get_candidate_models()
 
         prompt = f"""You are an expert enterprise data intake assistant.
 Analyze the user's input and extract structured entity information for persistence into a department database.
@@ -1049,44 +1106,94 @@ RELEVANT DATABASE RECORDS:
                 max_output_tokens=700,
             )
 
-            configured_model = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest").strip()
-            candidate_models = [
-                configured_model,
-                "gemini-flash-lite-latest",
-                "gemini-3.8-flash",
-                "gemini-3.5-flash",
-                "gemini-3.5-flash-lite",
-                "gemini-3.1-flash-lite",
-                "gemini-flash-latest",
-            ]
-            models_to_try = [m for m in candidate_models if m]
+            models_to_try = self.get_candidate_models()
 
+            # Build strictly alternating contents payload for Gemini API
             contents_payload = []
             if history:
+                sanitized_turns = []
                 for turn in history[-10:]:
-                    r = "user" if turn.get("role") in ("user", "human") else "model"
+                    role = "user" if turn.get("role") in ("user", "human") else "model"
                     txt = str(turn.get("content", "")).strip()
-                    if txt:
-                        contents_payload.append(types.Content(role=r, parts=[types.Part.from_text(text=txt)]))
-            contents_payload.append(types.Content(role="user", parts=[types.Part.from_text(text=user_message)]))
+                    if not txt:
+                        continue
+                    if sanitized_turns and sanitized_turns[-1]["role"] == role:
+                        sanitized_turns[-1]["content"] += f"\n{txt}"
+                    else:
+                        sanitized_turns.append({"role": role, "content": txt})
+
+                # If first turn is 'model', discard so first turn is always 'user'
+                if sanitized_turns and sanitized_turns[0]["role"] == "model":
+                    sanitized_turns.pop(0)
+
+                for t in sanitized_turns:
+                    contents_payload.append(types.Content(
+                        role=t["role"],
+                        parts=[types.Part.from_text(text=t["content"])],
+                    ))
+
+            # Ensure current user message is appended
+            if contents_payload and contents_payload[-1].role == "user":
+                contents_payload[-1].parts.append(types.Part.from_text(text=user_message))
+            else:
+                contents_payload.append(types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=user_message)],
+                ))
 
             for model_name in models_to_try:
                 try:
+                    logger.info(f"[GEMINI REQUEST] Generating answer with model '{model_name}' (query: '{user_message[:60]}...', grounded records: {total_records})")
                     response = await client.aio.models.generate_content(
                         model=model_name,
                         contents=contents_payload,
                         config=config,
                     )
-                    text = response.text or ""
+                    text = (response.text or "").strip()
                     if text:
+                        logger.info(f"[GEMINI SUCCESS] Model '{model_name}' generated answer successfully ({len(text)} chars).")
                         return {
                             "answer": text,
                             "model": model_name,
                             "grounded_records_count": total_records,
                         }
+                    else:
+                        logger.warning(f"[GEMINI EMPTY RESPONSE] Model '{model_name}' returned empty response text. Trying next model...")
                 except Exception as exc:
-                    logger.warning(f"Gemini model {model_name} failed: {exc}")
+                    exc_str = str(exc)
+                    exc_lower = exc_str.lower()
+                    if "403" in exc_str or "permission_denied" in exc_lower or "leaked" in exc_lower or "api_key_invalid" in exc_lower:
+                        logger.error(
+                            f"[GEMINI AUTH ERROR] API key authentication failed on model '{model_name}': {exc_str}. "
+                            "The key may be invalid, revoked, or flagged as leaked by Google security."
+                        )
+                    elif "429" in exc_str or "resource_exhausted" in exc_lower or "quota" in exc_lower:
+                        logger.error(
+                            f"[GEMINI QUOTA ERROR] Quota or rate limit exceeded on model '{model_name}': {exc_str}."
+                        )
+                    elif "timed out" in exc_lower or "timeout" in exc_lower:
+                        logger.error(
+                            f"[GEMINI TIMEOUT ERROR] Request timed out on model '{model_name}': {exc_str}."
+                        )
+                    elif "404" in exc_str or "not_found" in exc_lower:
+                        logger.warning(
+                            f"[GEMINI MODEL NOT FOUND] Model '{model_name}' not available ({exc_str}). Trying next model..."
+                        )
+                    else:
+                        logger.warning(
+                            f"[GEMINI API ERROR] Model '{model_name}' call failed ({type(exc).__name__}): {exc_str}. Trying next model..."
+                        )
                     continue
+
+            logger.warning(
+                f"[GEMINI FALLBACK TRIGGERED] All candidate Gemini models failed. "
+                f"Falling back to deterministic local SQLite grounding engine for query: '{user_message[:60]}...'"
+            )
+        else:
+            logger.info(
+                f"[GEMINI FALLBACK TRIGGERED] No active Gemini client. "
+                f"Serving query via deterministic local SQLite grounding engine for query: '{user_message[:60]}...'"
+            )
 
         # Local SQLite Grounded Fallback
         records = get_all_multi_db_records(db_path=db_path)

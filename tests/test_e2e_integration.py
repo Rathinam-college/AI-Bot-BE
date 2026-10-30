@@ -10,6 +10,8 @@ Tests:
 """
 
 import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import httpx
 from database.db import clear_database, init_db
 

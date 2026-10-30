@@ -4,14 +4,14 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
-BACKEND_DIR = ROOT_DIR / "backend"
+BACKEND_DIR = ROOT_DIR / "AI-Bot-BE"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 import pytest
 from fastapi.testclient import TestClient
-from backend.main import app
-from backend.database.db import init_all_dbs, list_users
+from main import app
+from database.db import init_all_dbs, list_users
 
 @pytest.fixture(scope="module")
 def client():

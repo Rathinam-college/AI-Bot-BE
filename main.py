@@ -22,8 +22,15 @@ from database.db import init_db, init_all_dbs
 from routers.api import api_router
 from routers.mock_target_apps import mock_router
 
-# Load environment configuration
-load_dotenv()
+# Load environment configuration from candidate locations
+for env_path in [
+    BASE_DIR / ".env",
+    BASE_DIR.parent / ".env",
+    Path.cwd() / ".env",
+]:
+    if env_path.is_file():
+        load_dotenv(dotenv_path=env_path, override=False)
+load_dotenv(override=False)
 
 # Setup logging
 logging.basicConfig(
@@ -39,6 +46,15 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing authoritative SQLite database (database/app.db)...")
     init_all_dbs()
     logger.info("Chatbot application startup completed with fresh, clean database.")
+
+    # Check Gemini AI integration status
+    from services.ai_engine import ai_engine
+    api_key, var_name = ai_engine._get_api_key()
+    if api_key:
+        logger.info(f"[STARTUP AI CHECK] Gemini API key configured via '{var_name}': {ai_engine._mask_key(api_key)}. Candidate models: {ai_engine.get_candidate_models()}")
+    else:
+        logger.warning("[STARTUP AI CHECK] No Gemini API key configured (GEMINI_API_KEY/GOOGLE_API_KEY). Running in local SQLite grounding fallback mode.")
+
     yield
     logger.info("Chatbot application shutting down.")
 
@@ -92,7 +108,9 @@ async def forward_mock_request(full_path: str, request: Request):
 app.include_router(mock_router)
 
 # Serve frontend files
-FRONTEND_DIR = BASE_DIR.parent / "frontend"
+FRONTEND_DIR = BASE_DIR.parent / "AI-Bot-FE"
+if not FRONTEND_DIR.exists():
+    FRONTEND_DIR = BASE_DIR.parent / "frontend"
 if not FRONTEND_DIR.exists():
     FRONTEND_DIR = BASE_DIR / "frontend"
 if not FRONTEND_DIR.exists():

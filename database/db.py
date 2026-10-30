@@ -4,9 +4,13 @@ Authoritative Single Database Architecture: database/app.db.
 Provides robust connection management, WAL mode, schema initialization,
 and deterministic deduplication storage.
 """
+import hashlib
+import json
 import os
+import secrets
 import sqlite3
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -311,6 +315,56 @@ def init_db(db_path: Optional[str] = None) -> None:
                     raw_json TEXT
                 );
             """)
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    full_name TEXT NOT NULL,
+                    email TEXT,
+                    role TEXT NOT NULL DEFAULT 'member',
+                    department TEXT DEFAULT 'General',
+                    permissions TEXT NOT NULL DEFAULT '["dashboard","chatbot","reports"]',
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TIMESTAMP NOT NULL,
+                    last_login TIMESTAMP
+                );
+            """)
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_sessions (
+                    token TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at TIMESTAMP NOT NULL,
+                    expires_at TIMESTAMP NOT NULL
+                );
+            """)
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    id TEXT PRIMARY KEY,
+                    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    title TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL
+                );
+            """)
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    model TEXT,
+                    grounded_count INTEGER DEFAULT 0,
+                    created_at TIMESTAMP NOT NULL
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_msg_session ON chat_messages(session_id);")
+
+            init_default_users(conn)
     finally:
         conn.close()
 
@@ -554,3 +608,439 @@ def clear_database(db_path: Optional[str] = None) -> None:
 def clear_all_databases() -> None:
     """Purge records from authoritative database."""
     clear_database()
+
+
+# ============================================================================
+# USER AUTHENTICATION & ACCESS CONTROL HELPERS
+# ============================================================================
+
+def hash_password(password: str) -> str:
+    """Hash password using standard PBKDF2-HMAC-SHA256 with 16-byte random salt."""
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100000)
+    return f"{salt}:{dk.hex()}"
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """Safely verify candidate password against stored salt:hash."""
+    try:
+        parts = password_hash.split(":")
+        if len(parts) != 2:
+            return False
+        salt, expected = parts
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100000)
+        return secrets.compare_digest(dk.hex(), expected)
+    except Exception:
+        return False
+
+
+def init_default_users(conn: sqlite3.Connection) -> None:
+    """Seed initial default accounts if users table is empty."""
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM users;")
+    count = cur.fetchone()[0]
+    if count == 0:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        default_users = [
+            (
+                "admin",
+                hash_password("admin123"),
+                "Campus Administrator",
+                "admin@rathinam.ac.in",
+                "admin",
+                "IT Administration",
+                json.dumps(["dashboard", "chatbot", "user_control", "upload_sql", "clear_db", "reports"]),
+                1,
+                now_iso,
+            ),
+            (
+                "sarah_mgr",
+                hash_password("manager123"),
+                "Sarah Jenkins",
+                "sarah.j@rathinam.ac.in",
+                "manager",
+                "Campus Operations",
+                json.dumps(["dashboard", "chatbot", "reports", "upload_sql"]),
+                1,
+                now_iso,
+            ),
+            (
+                "john_member",
+                hash_password("team123"),
+                "John Doe",
+                "john.doe@rathinam.ac.in",
+                "member",
+                "CCTV & Security",
+                json.dumps(["dashboard", "chatbot", "reports"]),
+                1,
+                now_iso,
+            ),
+        ]
+        cur.executemany("""
+            INSERT INTO users (username, password_hash, full_name, email, role, department, permissions, is_active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """, default_users)
+
+
+def authenticate_user(username: str, password: str, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Verify credentials and return user info dict on success, None on failure."""
+    conn = get_connection(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, username, password_hash, full_name, email, role, department, permissions, is_active, created_at, last_login
+            FROM users
+            WHERE username = ? COLLATE NOCASE;
+        """, (username,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        u = dict(row)
+        if not u["is_active"]:
+            return None
+        if not verify_password(password, u["password_hash"]):
+            return None
+
+        # Update last login timestamp
+        now_iso = datetime.now(timezone.utc).isoformat()
+        conn.execute("UPDATE users SET last_login = ? WHERE id = ?;", (now_iso, u["id"]))
+        conn.commit()
+
+        u.pop("password_hash", None)
+        try:
+            u["permissions"] = json.loads(u["permissions"]) if isinstance(u["permissions"], str) else u["permissions"]
+        except Exception:
+            u["permissions"] = ["dashboard", "chatbot", "reports"]
+        u["last_login"] = now_iso
+        return u
+    finally:
+        conn.close()
+
+
+def create_session(user_id: int, duration_hours: int = 72, db_path: Optional[str] = None) -> str:
+    """Generate session token and persist to database."""
+    token = secrets.token_hex(32)
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(hours=duration_hours)
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute("""
+                INSERT INTO user_sessions (token, user_id, created_at, expires_at)
+                VALUES (?, ?, ?, ?);
+            """, (token, user_id, now.isoformat(), expires.isoformat()))
+        return token
+    finally:
+        conn.close()
+
+
+def get_user_by_token(token: str, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Retrieve user object for active session token, or None if expired/invalid."""
+    if not token:
+        return None
+    conn = get_connection(db_path)
+    try:
+        cur = conn.cursor()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cur.execute("""
+            SELECT u.id, u.username, u.full_name, u.email, u.role, u.department, u.permissions, u.is_active, u.created_at, u.last_login
+            FROM user_sessions s
+            JOIN users u ON s.user_id = u.id
+            WHERE s.token = ? AND s.expires_at > ? AND u.is_active = 1;
+        """, (token, now_iso))
+        row = cur.fetchone()
+        if not row:
+            return None
+        u = dict(row)
+        try:
+            u["permissions"] = json.loads(u["permissions"]) if isinstance(u["permissions"], str) else u["permissions"]
+        except Exception:
+            u["permissions"] = ["dashboard", "chatbot", "reports"]
+        return u
+    finally:
+        conn.close()
+
+
+def delete_session(token: str, db_path: Optional[str] = None) -> None:
+    """Revoke session token."""
+    if not token:
+        return
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute("DELETE FROM user_sessions WHERE token = ?;", (token,))
+    finally:
+        conn.close()
+
+
+def list_users(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """List all users without password hash."""
+    conn = get_connection(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, username, full_name, email, role, department, permissions, is_active, created_at, last_login
+            FROM users
+            ORDER BY id ASC;
+        """)
+        users = []
+        for row in cur.fetchall():
+            u = dict(row)
+            try:
+                u["permissions"] = json.loads(u["permissions"]) if isinstance(u["permissions"], str) else u["permissions"]
+            except Exception:
+                u["permissions"] = ["dashboard", "chatbot", "reports"]
+            users.append(u)
+        return users
+    finally:
+        conn.close()
+
+
+def create_user(
+    username: str,
+    password: str,
+    full_name: str,
+    email: str = "",
+    role: str = "member",
+    department: str = "General",
+    permissions: Optional[List[str]] = None,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create a new team member user account."""
+    if not permissions:
+        if role == "admin":
+            permissions = ["dashboard", "chatbot", "user_control", "upload_sql", "clear_db", "reports"]
+        elif role == "manager":
+            permissions = ["dashboard", "chatbot", "reports", "upload_sql"]
+        else:
+            permissions = ["dashboard", "chatbot", "reports"]
+
+    pwd_hash = hash_password(password)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            cur = conn.execute("""
+                INSERT INTO users (username, password_hash, full_name, email, role, department, permissions, is_active, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?);
+            """, (username.strip(), pwd_hash, full_name.strip(), email.strip(), role, department.strip(), json.dumps(permissions), now_iso))
+            user_id = cur.lastrowid
+        return {
+            "id": user_id,
+            "username": username.strip(),
+            "full_name": full_name.strip(),
+            "email": email.strip(),
+            "role": role,
+            "department": department.strip(),
+            "permissions": permissions,
+            "is_active": 1,
+            "created_at": now_iso,
+        }
+    finally:
+        conn.close()
+
+
+def update_user(user_id: int, updates: Dict[str, Any], db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Update user properties (role, permissions, active state, password, etc.)."""
+    allowed_fields = ["full_name", "email", "role", "department", "permissions", "is_active", "password"]
+    clauses = []
+    values = []
+
+    for k, v in updates.items():
+        if k not in allowed_fields:
+            continue
+        if k == "password":
+            clauses.append("password_hash = ?")
+            values.append(hash_password(v))
+        elif k == "permissions":
+            clauses.append("permissions = ?")
+            values.append(json.dumps(v) if isinstance(v, list) else v)
+        else:
+            clauses.append(f"{k} = ?")
+            values.append(v)
+
+    if not clauses:
+        return None
+
+    values.append(user_id)
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute(f"UPDATE users SET {', '.join(clauses)} WHERE id = ?;", tuple(values))
+
+        cur = conn.cursor()
+        cur.execute("SELECT id, username, full_name, email, role, department, permissions, is_active, created_at, last_login FROM users WHERE id = ?;", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        u = dict(row)
+        try:
+            u["permissions"] = json.loads(u["permissions"]) if isinstance(u["permissions"], str) else u["permissions"]
+        except Exception:
+            u["permissions"] = []
+        return u
+    finally:
+        conn.close()
+
+
+def delete_user(user_id: int, db_path: Optional[str] = None) -> bool:
+    """Delete a user account."""
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            cur = conn.execute("DELETE FROM users WHERE id = ?;", (user_id,))
+            return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ============================================================================
+# CHAT SESSIONS & HISTORY HELPERS
+# ============================================================================
+
+def create_chat_session(
+    title: str = "New Chat",
+    user_id: Optional[int] = None,
+    session_id: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create a new chat conversation session."""
+    sid = session_id or f"sess_{uuid.uuid4().hex[:12]}"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute("""
+                INSERT INTO chat_sessions (id, user_id, title, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?);
+            """, (sid, user_id, title, now_iso, now_iso))
+        return {
+            "id": sid,
+            "user_id": user_id,
+            "title": title,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+            "message_count": 0,
+        }
+    finally:
+        conn.close()
+
+
+def list_chat_sessions(user_id: Optional[int] = None, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """List recent chat sessions with message counts."""
+    conn = get_connection(db_path)
+    try:
+        cur = conn.cursor()
+        if user_id is not None:
+            cur.execute("""
+                SELECT s.id, s.user_id, s.title, s.created_at, s.updated_at,
+                       COUNT(m.id) as message_count,
+                       (SELECT content FROM chat_messages WHERE session_id = s.id ORDER BY id ASC LIMIT 1) as first_message
+                FROM chat_sessions s
+                LEFT JOIN chat_messages m ON s.id = m.session_id
+                WHERE s.user_id = ? OR s.user_id IS NULL
+                GROUP BY s.id
+                ORDER BY s.updated_at DESC;
+            """, (user_id,))
+        else:
+            cur.execute("""
+                SELECT s.id, s.user_id, s.title, s.created_at, s.updated_at,
+                       COUNT(m.id) as message_count,
+                       (SELECT content FROM chat_messages WHERE session_id = s.id ORDER BY id ASC LIMIT 1) as first_message
+                FROM chat_sessions s
+                LEFT JOIN chat_messages m ON s.id = m.session_id
+                GROUP BY s.id
+                ORDER BY s.updated_at DESC;
+            """)
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_chat_session(session_id: str, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Retrieve metadata of a single chat session."""
+    conn = get_connection(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, user_id, title, created_at, updated_at FROM chat_sessions WHERE id = ?;", (session_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def delete_chat_session(session_id: str, db_path: Optional[str] = None) -> bool:
+    """Delete a chat session and its messages."""
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            cur = conn.execute("DELETE FROM chat_sessions WHERE id = ?;", (session_id,))
+            return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def add_chat_message(
+    session_id: str,
+    role: str,
+    content: str,
+    model: Optional[str] = None,
+    grounded_count: int = 0,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Store a message turn and update the session title if first turn."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            # Ensure session exists
+            cur = conn.cursor()
+            cur.execute("SELECT id, title FROM chat_sessions WHERE id = ?;", (session_id,))
+            session_row = cur.fetchone()
+            if not session_row:
+                # Auto-create session
+                title = content[:40].strip() + ("..." if len(content) > 40 else "")
+                conn.execute("""
+                    INSERT INTO chat_sessions (id, title, created_at, updated_at)
+                    VALUES (?, ?, ?, ?);
+                """, (session_id, title, now_iso, now_iso))
+            elif session_row["title"] in ("New Chat", "Untitled Chat") and role == "user":
+                auto_title = content[:40].strip() + ("..." if len(content) > 40 else "")
+                conn.execute("UPDATE chat_sessions SET title = ?, updated_at = ? WHERE id = ?;", (auto_title, now_iso, session_id))
+            else:
+                conn.execute("UPDATE chat_sessions SET updated_at = ? WHERE id = ?;", (now_iso, session_id))
+
+            cur = conn.execute("""
+                INSERT INTO chat_messages (session_id, role, content, model, grounded_count, created_at)
+                VALUES (?, ?, ?, ?, ?, ?);
+            """, (session_id, role, content, model, grounded_count, now_iso))
+            msg_id = cur.lastrowid
+
+        return {
+            "id": msg_id,
+            "session_id": session_id,
+            "role": role,
+            "content": content,
+            "model": model,
+            "grounded_count": grounded_count,
+            "created_at": now_iso,
+        }
+    finally:
+        conn.close()
+
+
+def get_chat_messages(session_id: str, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Retrieve full chronological conversation for a session."""
+    conn = get_connection(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, session_id, role, content, model, grounded_count, created_at
+            FROM chat_messages
+            WHERE session_id = ?
+            ORDER BY id ASC;
+        """, (session_id,))
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+

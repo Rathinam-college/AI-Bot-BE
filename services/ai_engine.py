@@ -535,6 +535,23 @@ Return STRICT JSON ONLY matching:
             if total_campus_spend > 0:
                 sql_facts.insert(0, f"### 🏛️ OVERALL CAMPUS MONETARY SPEND (ALL DEPARTMENTS):\n- **Total Recorded Spend:** ₹{total_campus_spend:,.2f} (Food Procurement: ₹{total_campus_spend - fuel_spend:,.2f} + Transport Fuel: ₹{fuel_spend:,.2f})\n")
 
+            # Executive Audit & Forecasting Context Injection
+            if any(k in msg_lower for k in ["forecast", "prediction", "predict", "next month", "audit report", "monthly audit"]):
+                try:
+                    from services.reporting_engine import reporting_engine
+                    forecast_info = reporting_engine.predict_procurement_and_demand(db_path=db_path)
+                    reqs = forecast_info["projected_requirements"]
+                    sql_facts.append(
+                        f"\n### 🔮 EXECUTIVE DEMAND & PROCUREMENT FORECAST ({forecast_info['forecast_period']['target_forecast_month']}):\n"
+                        f"- **Executive Narrative:** {forecast_info['executive_narrative']}\n"
+                        f"- **Projected Next-Month Operational Budget:** ₹{reqs['total_campus_budget']:,.2f}\n"
+                        f"- **Projected Food Spend:** ₹{reqs['food_procurement_spend']:,.2f}\n"
+                        f"- **Projected Transport Fuel Spend:** ₹{reqs['transport_fuel_spend']:,.2f} (~{reqs['transport_fuel_liters']:,.0f} Liters)\n"
+                        f"- **Trend Direction:** {reqs['trend_direction'].upper()} ({reqs['projected_growth_rate_pct']:+.1f}%)\n"
+                    )
+                except Exception as exc:
+                    logger.warning(f"Error appending forecast facts: {exc}")
+
             # 4. Contextually Relevant Database Records
             msg_lower = user_message.lower().strip()
             terms = [

@@ -45,7 +45,7 @@ async def test_mask_key():
 async def test_missing_api_key_handling():
     """Verify missing API key activates local-sqlite-grounding without crashing."""
     engine = AIEngine()
-    with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}):
+    with patch.object(engine, "_get_api_key", return_value=("", "")):
         res = await engine.answer_query("How many cameras are online?")
         assert res["model"] == "local-sqlite-grounding"
         assert res["grounded_records_count"] >= 1

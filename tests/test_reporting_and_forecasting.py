@@ -116,3 +116,4 @@ def test_api_forecasting_endpoint(client):
     assert data["status"] == "success"
     assert "projected_requirements" in data
     assert "executive_narrative" in data
+

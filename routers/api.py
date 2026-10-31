@@ -642,10 +642,13 @@ async def add_individual_record(req: IndividualRecordRequest):
 
 
 @api_router.post("/database/clear")
-async def purge_database():
+async def purge_database(authorization: Optional[str] = Header(None)):
     """
     Completely clear all data from authoritative database/app.db (software_records, sync_history, and domain tables).
     """
+    user = await get_current_user_optional(authorization)
+    if user and user.get("role") != "admin" and "clear_db" not in user.get("permissions", []):
+        raise HTTPException(status_code=403, detail="Forbidden: Database clear permission required.")
     try:
         from database.db import clear_database
         clear_database()
@@ -660,10 +663,13 @@ async def purge_database():
 
 
 @api_router.post("/import-all-dumps")
-async def import_all_uploaded_dumps_endpoint():
+async def import_all_uploaded_dumps_endpoint(authorization: Optional[str] = Header(None)):
     """
     Ingest all uploaded SQL files into their respective departments in SQLite with full attribute fidelity.
     """
+    user = await get_current_user_optional(authorization)
+    if user and user.get("role") != "admin" and "upload_sql" not in user.get("permissions", []):
+        raise HTTPException(status_code=403, detail="Forbidden: SQL ingestion permission required.")
     try:
         from services.sql_dump_importer import ingest_all_uploaded_dumps
         result = ingest_all_uploaded_dumps()
@@ -680,7 +686,7 @@ async def import_all_uploaded_dumps_endpoint():
 
 
 @api_router.post("/upload-sql-backup")
-async def upload_sql_backup_file(file: UploadFile = File(...)):
+async def upload_sql_backup_file(file: UploadFile = File(...), authorization: Optional[str] = Header(None)):
     """
     Accept ANY uploaded .sql file from UI:
     1. Validates file extension, size, and syntax.
@@ -689,6 +695,9 @@ async def upload_sql_backup_file(file: UploadFile = File(...)):
     4. Records ingestion metrics (discovered, inserted, skipped, updated, rejected, failed).
     5. Returns live database metrics and immediate chatbot accessibility.
     """
+    user = await get_current_user_optional(authorization)
+    if user and user.get("role") != "admin" and "upload_sql" not in user.get("permissions", []):
+        raise HTTPException(status_code=403, detail="Forbidden: SQL upload and ingestion permission required.")
     if not file.filename.lower().endswith(".sql"):
         raise HTTPException(status_code=400, detail="Only .sql database dump files are supported.")
 

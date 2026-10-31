@@ -297,6 +297,66 @@ async def generate_session_report(session_id: str, authorization: Optional[str] 
 
 
 # ============================================================================
+# EXECUTIVE AUDIT REPORTING & DEMAND FORECASTING ENDPOINTS
+# ============================================================================
+from services.reporting_engine import reporting_engine
+from fastapi.responses import Response
+
+@api_router.get("/reports/available-months")
+async def get_available_audit_months():
+    """Retrieve list of available YYYY-MM audit reporting months."""
+    months = reporting_engine.get_available_months()
+    return {"status": "success", "months": months}
+
+
+@api_router.get("/reports/monthly-audit")
+async def get_monthly_audit_report(
+    month: Optional[str] = Query(None, description="Month in YYYY-MM format"),
+    department: Optional[str] = Query(None, description="Department filter (Food, Transport, CCTV)"),
+):
+    """Generate consolidated monthly financial & operational executive audit report."""
+    try:
+        report = reporting_engine.generate_monthly_audit_report(month=month, department=department)
+        return report
+    except Exception as exc:
+        logger.error(f"Error generating monthly audit report: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@api_router.get("/reports/monthly-audit/csv")
+async def download_monthly_audit_csv(
+    month: Optional[str] = Query(None, description="Month in YYYY-MM format"),
+    department: Optional[str] = Query(None, description="Department filter (Food, Transport, CCTV)"),
+):
+    """Export monthly audit report and detailed ledger as a downloadable CSV."""
+    try:
+        csv_data = reporting_engine.generate_monthly_audit_csv(month=month, department=department)
+        target_month = month or reporting_engine.get_available_months()[0]
+        filename = f"rathinam_audit_report_{target_month}.csv"
+        return Response(
+            content=csv_data,
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+    except Exception as exc:
+        logger.error(f"Error generating audit CSV: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@api_router.get("/reports/forecasting")
+async def get_procurement_forecasting(
+    department: Optional[str] = Query(None, description="Department filter (Food, Transport)"),
+):
+    """Project next month's procurement demand, estimated budget, and restocking requirements."""
+    try:
+        forecast = reporting_engine.predict_procurement_and_demand(department=department)
+        return forecast
+    except Exception as exc:
+        logger.error(f"Error generating procurement forecasting: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ============================================================================
 # DASHBOARD SUMMARY ENDPOINT
 # ============================================================================
 

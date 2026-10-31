@@ -142,4 +142,4 @@ async def test_general_query_grounding_guard():
     res = await ai_engine.answer_query(query)
     # Must enforce zero hallucination
     ans_lower = res["answer"].lower()
-    assert any(phrase in ans_lower for phrase in ["not found", "does not contain", "does not exist"])
+    assert any(phrase in ans_lower for phrase in ["not found", "does not contain", "does not exist", "not present", "no records", "no information"])

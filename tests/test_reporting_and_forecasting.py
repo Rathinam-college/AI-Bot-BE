@@ -117,3 +117,35 @@ def test_api_forecasting_endpoint(client):
     assert "projected_requirements" in data
     assert "executive_narrative" in data
 
+
+
+def test_api_dashboard_summary_analytical_charts(client):
+    """Verify GET /api/dashboard/summary returns dynamic analytical bar charts for CCTV, Food, and Transport."""
+    res = client.get("/api/dashboard/summary")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "success"
+
+    # Verify CCTV bar chart
+    assert "cctv" in data
+    assert "chart" in data["cctv"]
+    cctv_chart = data["cctv"]["chart"]
+    assert "labels" in cctv_chart and "values" in cctv_chart and "colors" in cctv_chart
+    assert len(cctv_chart["labels"]) == len(cctv_chart["values"])
+    assert "Cameras" in cctv_chart["labels"]
+
+    # Verify Food bar chart
+    assert "food" in data
+    assert "chart" in data["food"]
+    food_chart = data["food"]["chart"]
+    assert "labels" in food_chart and "values" in food_chart and "colors" in food_chart
+    assert len(food_chart["labels"]) == len(food_chart["values"])
+    assert "Menu Items" in food_chart["labels"]
+
+    # Verify Transport bar chart
+    assert "transport" in data
+    assert "chart" in data["transport"]
+    trans_chart = data["transport"]["chart"]
+    assert "labels" in trans_chart and "values" in trans_chart and "colors" in trans_chart
+    assert len(trans_chart["labels"]) == len(trans_chart["values"])
+    assert "Active Buses" in trans_chart["labels"]

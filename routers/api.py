@@ -360,6 +360,12 @@ async def get_procurement_forecasting(
 # DASHBOARD SUMMARY ENDPOINT
 # ============================================================================
 
+@api_router.get("/diagnostics/ai")
+async def get_ai_diagnostics():
+    """Diagnostic endpoint to inspect Gemini configuration and live API status."""
+    return await ai_engine.run_diagnostics()
+
+
 @api_router.get("/dashboard/summary")
 async def get_dashboard_summary():
     """Aggregate high-level KPIs and operational metrics across campus services."""

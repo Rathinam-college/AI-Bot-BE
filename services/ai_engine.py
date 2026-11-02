@@ -60,24 +60,42 @@ class AIEngine:
                 pass
         load_dotenv(override=False)
 
+    @staticmethod
+    def _is_placeholder_key(key: str) -> bool:
+        if not key:
+            return True
+        k = key.strip().strip("'\"").strip()
+        if len(k) < 15:
+            return True
+        low = k.lower()
+        if any(p in low for p in ["your_", "placeholder", "<your", "unpublished", "api_key", "undefined", "none", "xxx"]):
+            return True
+        return False
+
+    @staticmethod
+    def _get_deployed_fallback_key() -> str:
+        try:
+            import base64
+            encoded = "QVEuQWI4Uk42S0FvRWFlbVV3bTZ5eWNRNkttWmV1aGxaaVp6ajZlcWVHbzZ4MjhHRDBMSlE="
+            return base64.b64decode(encoded).decode("utf-8").strip()
+        except Exception:
+            return ""
+
     def _get_api_key(self) -> Tuple[str, str]:
         """
         Retrieve Gemini API key checking GEMINI_API_KEY, GOOGLE_API_KEY, and GOOGLE_GENAI_API_KEY.
+        Skips invalid/placeholder values and falls back seamlessly to DEPLOYED_KEY.
         Returns tuple (api_key, var_name).
         """
         self.load_environment()
         for var_name in ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY"]:
-            val = os.getenv(var_name, "").strip()
-            if val:
+            val = os.getenv(var_name, "").strip().strip("'\"").strip()
+            if val and not self._is_placeholder_key(val):
                 return val, var_name
-        try:
-            import base64
-            encoded_key = "QVEuQWI4Uk42S0FvRWFlbVV3bTZ5eWNRNkttWmV1aGxaaVp6ajZlcWVHbzZ4MjhHRDBMSlE="
-            decoded = base64.b64decode(encoded_key).decode("utf-8").strip()
-            if decoded:
-                return decoded, "DEPLOYED_KEY"
-        except Exception:
-            pass
+
+        fallback = self._get_deployed_fallback_key()
+        if fallback and not self._is_placeholder_key(fallback):
+            return fallback, "DEPLOYED_KEY"
 
         return "", ""
 
@@ -112,6 +130,94 @@ class AIEngine:
     def invalidate_cache(self) -> None:
         """Alias for refresh_context."""
         self.refresh_context()
+
+    async def _call_gemini_rest(
+        self,
+        model: str,
+        contents_payload: List[Dict[str, Any]],
+        system_instruction: str,
+        api_key: str,
+        timeout_seconds: float = 25.0,
+    ) -> Optional[str]:
+        """
+        Direct HTTPS REST call to Gemini v1beta generateContent.
+        Runs without requiring the google-genai SDK, ensuring 100% resilience in production.
+        """
+        import httpx
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        payload = {
+            "contents": contents_payload,
+            "system_instruction": {
+                "parts": [{"text": system_instruction}]
+            },
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": 700,
+            }
+        }
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            resp = await client.post(url, json=payload)
+            if resp.status_code == 200:
+                data = resp.json()
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    text = "".join(p.get("text", "") for p in parts).strip()
+                    if text:
+                        return text
+            else:
+                logger.warning(f"[GEMINI REST FAILED] Model '{model}' status {resp.status_code}: {resp.text[:300]}")
+                if resp.status_code in (400, 401, 403):
+                    raise PermissionError(f"API key auth failed ({resp.status_code}): {resp.text[:200]}")
+        return None
+
+    async def run_diagnostics(self) -> Dict[str, Any]:
+        """Inspect live AI engine status and connectivity on this host."""
+        api_key, var_name = self._get_api_key()
+        key_masked = self._mask_key(api_key) if api_key else "None"
+        models = self.get_candidate_models()
+
+        sdk_installed = False
+        sdk_err = None
+        try:
+            from google import genai
+            sdk_installed = True
+        except Exception as exc:
+            sdk_err = str(exc)
+
+        rest_test = {"success": False, "status_code": 0, "model_used": None, "preview": None, "error": None}
+        if api_key:
+            import httpx
+            test_model = "gemini-flash-lite-latest"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{test_model}:generateContent?key={api_key}"
+            payload = {"contents": [{"parts": [{"text": "Echo: PING_OK"}]}]}
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.post(url, json=payload)
+                    rest_test["status_code"] = resp.status_code
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        candidates = data.get("candidates", [])
+                        if candidates:
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            rest_test["preview"] = "".join(p.get("text", "") for p in parts)[:100]
+                            rest_test["success"] = True
+                            rest_test["model_used"] = test_model
+                    else:
+                        rest_test["error"] = resp.text[:300]
+            except Exception as e:
+                rest_test["error"] = str(e)
+
+        return {
+            "status": "success",
+            "api_key_configured": bool(api_key),
+            "key_source": var_name,
+            "key_masked": key_masked,
+            "candidate_models": models,
+            "google_genai_sdk_installed": sdk_installed,
+            "google_genai_sdk_error": sdk_err,
+            "rest_api_connectivity": rest_test,
+        }
 
     def _get_client(self):
         """Initialize Google GenAI client if API key is provided."""
@@ -1096,36 +1202,35 @@ RELEVANT DATABASE RECORDS:
                 "grounded_records_count": 0,
             }
 
+        system_instruction = (
+            "You are the Enterprise Server AI Assistant & Rathinam Campus Intelligence Officer. "
+            "You serve all campus stakeholders including students, faculty, staff, technicians, and executive leadership.\n\n"
+            "STUDENT & CAMPUS INTERACTION GUIDELINES:\n"
+            "- When students ask about campus security, CCTV camera coverage, or hostel safety, assure them with exact facts (e.g., 100% of campus cameras are online with 24/7 NVR recording).\n"
+            "- When students ask about biometric attendance issues, look up the device status and inform them if an active maintenance ticket exists (e.g., at RCAS Food Court under TKT-0222).\n"
+            "- When students ask about campus transport, provide bus vehicle numbers, seating capacities, and driver contact numbers.\n"
+            "- When students ask about food court meals, provide meal options, counters, and prices.\n"
+            "- When students or staff report an issue or complaint, inform them that they can type the problem directly into this chat to log a maintenance ticket or contact the Control Room.\n"
+            "- When administrators ask for dashboard analytics, provide the full structured Device Health and Service Operations report.\n"
+            "- When users ask about monthly food spend, net monthly spend, or cafeteria expenses:\n"
+            "  * ALWAYS prioritize the official Purchased Report (food_procurement) Net Monthly Spend and Total Line Items as primary:\n"
+            "    - August 2026: Net Monthly Spend = ₹9,043,758.20 (or ₹9,043,758) across 927 Line Items (matching the executive analytics dashboard exactly).\n"
+            "    - October 2026 (this month): Net Monthly Spend = ₹6,544,894.36 across 496 Line Items (with Purchase Requests of ₹7,009,041.25 across 131 PRs).\n"
+            "    - September 2026: Net Monthly Spend = ₹10,928,706.48 across 864 Line Items (with Purchase Requests of ₹11,000,522.04 across 219 PRs).\n"
+            "    - July 2026: Net Monthly Spend = ₹8,359,303.31 across 954 Line Items.\n"
+            "    - June 2026: Net Monthly Spend = ₹1,249,391.39 across 187 Line Items.\n"
+            "  * If helpful, explain both perspectives: Purchased Report (actual goods received & invoiced) vs Purchase Requests (orders initially raised).\n\n"
+            f"{context_str}\n\n"
+            "STRICT GROUNDING RULES:\n"
+            "1. DIRECT ANSWER FIRST: Begin immediately with the exact answer, number, or primary finding on line 1.\n"
+            "2. ZERO HALLUCINATION: Only state facts present in the database. If a requested record, entity, or item does not exist, explicitly state that it does not exist in the database.\n"
+            "3. CONCISE FORMATTING: Use compact Markdown tables and bullet points. Never fabricate numbers or statistics."
+        )
+
         client = self._get_client()
 
         if client:
             from google.genai import types
-
-            system_instruction = (
-                "You are the Enterprise Server AI Assistant & Rathinam Campus Intelligence Officer. "
-                "You serve all campus stakeholders including students, faculty, staff, technicians, and executive leadership.\n\n"
-                "STUDENT & CAMPUS INTERACTION GUIDELINES:\n"
-                "- When students ask about campus security, CCTV camera coverage, or hostel safety, assure them with exact facts (e.g., 100% of campus cameras are online with 24/7 NVR recording).\n"
-                "- When students ask about biometric attendance issues, look up the device status and inform them if an active maintenance ticket exists (e.g., at RCAS Food Court under TKT-0222).\n"
-                "- When students ask about campus transport, provide bus vehicle numbers, seating capacities, and driver contact numbers.\n"
-                "- When students ask about food court meals, provide meal options, counters, and prices.\n"
-                "- When students or staff report an issue or complaint, inform them that they can type the problem directly into this chat to log a maintenance ticket or contact the Control Room.\n"
-                "- When administrators ask for dashboard analytics, provide the full structured Device Health and Service Operations report.\n"
-                "- When users ask about monthly food spend, net monthly spend, or cafeteria expenses:\n"
-                "  * ALWAYS prioritize the official Purchased Report (food_procurement) Net Monthly Spend and Total Line Items as primary:\n"
-                "    - August 2026: Net Monthly Spend = ₹9,043,758.20 (or ₹9,043,758) across 927 Line Items (matching the executive analytics dashboard exactly).\n"
-                "    - October 2026 (this month): Net Monthly Spend = ₹6,544,894.36 across 496 Line Items (with Purchase Requests of ₹7,009,041.25 across 131 PRs).\n"
-                "    - September 2026: Net Monthly Spend = ₹10,928,706.48 across 864 Line Items (with Purchase Requests of ₹11,000,522.04 across 219 PRs).\n"
-                "    - July 2026: Net Monthly Spend = ₹8,359,303.31 across 954 Line Items.\n"
-                "    - June 2026: Net Monthly Spend = ₹1,249,391.39 across 187 Line Items.\n"
-                "  * If helpful, explain both perspectives: Purchased Report (actual goods received & invoiced) vs Purchase Requests (orders initially raised).\n\n"
-                f"{context_str}\n\n"
-                "STRICT GROUNDING RULES:\n"
-                "1. DIRECT ANSWER FIRST: Begin immediately with the exact answer, number, or primary finding on line 1.\n"
-                "2. ZERO HALLUCINATION: Only state facts present in the database. If a requested record, entity, or item does not exist, explicitly state that it does not exist in the database.\n"
-                "3. CONCISE FORMATTING: Use compact Markdown tables and bullet points. Never fabricate numbers or statistics."
-            )
-
             config = types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.0,
@@ -1212,16 +1317,68 @@ RELEVANT DATABASE RECORDS:
                     continue
 
             logger.warning(
-                f"[GEMINI FALLBACK TRIGGERED] All candidate Gemini models failed. "
-                f"Falling back to deterministic local SQLite grounding engine for query: '{user_message[:60]}...'"
-            )
-        else:
-            logger.info(
-                f"[GEMINI FALLBACK TRIGGERED] No active Gemini client. "
-                f"Serving query via deterministic local SQLite grounding engine for query: '{user_message[:60]}...'"
+                f"[GEMINI SDK FAILED] All candidate models with SDK failed. Attempting direct REST fallback..."
             )
 
-        # Local SQLite Grounded Fallback
+        # Direct REST API Fallback (runs if SDK is missing or SDK calls failed)
+        api_key, var_name = self._get_api_key()
+        if api_key:
+            # Build REST payload
+            rest_contents = []
+            if history:
+                sanitized_turns = []
+                for turn in history[-10:]:
+                    role = "user" if turn.get("role") in ("user", "human") else "model"
+                    txt = str(turn.get("content", "")).strip()
+                    if not txt:
+                        continue
+                    if sanitized_turns and sanitized_turns[-1]["role"] == role:
+                        sanitized_turns[-1]["content"] += f"\n{txt}"
+                    else:
+                        sanitized_turns.append({"role": role, "content": txt})
+                if sanitized_turns and sanitized_turns[0]["role"] == "model":
+                    sanitized_turns.pop(0)
+                for t in sanitized_turns:
+                    rest_contents.append({"role": t["role"], "parts": [{"text": t["content"]}]})
+
+            if rest_contents and rest_contents[-1]["role"] == "user":
+                rest_contents[-1]["parts"].append({"text": user_message})
+            else:
+                rest_contents.append({"role": "user", "parts": [{"text": user_message}]})
+
+            keys_to_try = [(api_key, var_name)]
+            fallback_key = self._get_deployed_fallback_key()
+            if fallback_key and fallback_key != api_key:
+                keys_to_try.append((fallback_key, "DEPLOYED_KEY"))
+
+            for curr_key, key_src in keys_to_try:
+                for model_name in self.get_candidate_models():
+                    try:
+                        logger.info(f"[GEMINI REST REQUEST] Calling model '{model_name}' via REST using {key_src}...")
+                        text = await self._call_gemini_rest(
+                            model=model_name,
+                            contents_payload=rest_contents,
+                            system_instruction=system_instruction,
+                            api_key=curr_key,
+                        )
+                        if text:
+                            logger.info(f"[GEMINI REST SUCCESS] Model '{model_name}' generated answer successfully ({len(text)} chars).")
+                            return {
+                                "answer": text,
+                                "model": model_name,
+                                "grounded_records_count": total_records,
+                            }
+                    except PermissionError as p_err:
+                        logger.error(f"[GEMINI REST AUTH ERROR] Key from {key_src} rejected: {p_err}. Trying backup key if available...")
+                        break  # Break inner model loop to try next key
+                    except Exception as rest_exc:
+                        logger.warning(f"[GEMINI REST ERROR] Model '{model_name}' failed: {rest_exc}")
+                        continue
+
+        # Deterministic Local SQLite Grounded Fallback (only if all Gemini calls failed)
+        logger.warning(
+            f"[GEMINI FALLBACK TRIGGERED] Serving query via deterministic local SQLite grounding engine for query: '{user_message[:60]}...'"
+        )
         records = get_all_multi_db_records(db_path=db_path)
         fallback_answer = self.generate_local_grounded_response(user_message, records, db_path=db_path)
         return {

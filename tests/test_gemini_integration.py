@@ -61,7 +61,7 @@ async def test_invalid_api_key_handling():
         side_effect=Exception("403 PERMISSION_DENIED: Your API key was reported as leaked.")
     )
 
-    with patch.object(engine, "_get_client", return_value=fake_client):
+    with patch.object(engine, "_get_client", return_value=fake_client), patch.object(engine, "_call_gemini_rest", return_value=None):
         res = await engine.answer_query("Tell me about campus CCTV")
         assert res["model"] == "local-sqlite-grounding"
         assert "answer" in res
@@ -77,7 +77,7 @@ async def test_quota_exceeded_handling():
         side_effect=Exception("429 RESOURCE_EXHAUSTED: Quota exceeded for quota group.")
     )
 
-    with patch.object(engine, "_get_client", return_value=fake_client):
+    with patch.object(engine, "_get_client", return_value=fake_client), patch.object(engine, "_call_gemini_rest", return_value=None):
         res = await engine.answer_query("List cafeteria items")
         assert res["model"] == "local-sqlite-grounding"
 
@@ -91,7 +91,7 @@ async def test_timeout_handling():
         side_effect=TimeoutError("Request timed out after 30.0s")
     )
 
-    with patch.object(engine, "_get_client", return_value=fake_client):
+    with patch.object(engine, "_get_client", return_value=fake_client), patch.object(engine, "_call_gemini_rest", return_value=None):
         res = await engine.answer_query("Check fleet status")
         assert res["model"] == "local-sqlite-grounding"
 
@@ -133,6 +133,21 @@ async def test_long_campus_query_handling():
     res = await ai_engine.answer_query(long_query)
     assert res["grounded_records_count"] >= 1
     assert len(res["answer"]) > 50
+
+
+@pytest.mark.asyncio
+async def test_gemini_rest_fallback():
+    """Verify that when Google GenAI SDK fails, direct REST fallback activates and returns answer."""
+    engine = AIEngine()
+    fake_client = MagicMock()
+    fake_client.aio.models.generate_content = AsyncMock(
+        side_effect=ImportError("No module named google.genai")
+    )
+
+    with patch.object(engine, "_get_client", return_value=None), patch.object(engine, "_call_gemini_rest", return_value="REST Generated Response"):
+        res = await engine.answer_query("How many buses are active?")
+        assert res["model"] == "gemini-flash-lite-latest"
+        assert res["answer"] == "REST Generated Response"
 
 
 @pytest.mark.asyncio

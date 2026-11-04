@@ -13,6 +13,16 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import logging
+logger = logging.getLogger("database")
+
+from database.postgres_db import (
+    get_postgres_config,
+    get_postgres_connection,
+    init_postgres_db,
+    is_postgres_available,
+    is_postgres_configured,
+)
 
 
 def find_project_root() -> Path:
@@ -56,7 +66,15 @@ def resolve_db_path(db_path: Optional[str] = None) -> Path:
     return target
 
 
-def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
+def get_active_db_engine() -> str:
+    """Check active database engine ('postgresql' or 'sqlite')."""
+    if is_postgres_configured():
+        if is_postgres_available():
+            return "postgresql"
+    return "sqlite"
+
+
+def get_sqlite_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     """Create and return a SQLite connection with row factory enabled."""
     target_path = resolve_db_path(db_path)
     conn = sqlite3.connect(str(target_path), timeout=15.0)
@@ -65,6 +83,24 @@ def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000;")
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
+
+
+def get_connection(db_path: Optional[str] = None):
+    """
+    Return active database connection.
+    Routes to PostgreSQL when configured and reachable, otherwise falls back to SQLite.
+    """
+    if db_path and ("test" in str(db_path).lower()):
+        return get_sqlite_connection(db_path)
+
+    if get_active_db_engine() == "postgresql":
+        try:
+            return get_postgres_connection()
+        except Exception as exc:
+            logger.warning(f"PostgreSQL connection failed ({exc}). Falling back to SQLite.")
+            return get_sqlite_connection(db_path)
+
+    return get_sqlite_connection(db_path)
 
 
 def init_db(db_path: Optional[str] = None) -> None:
@@ -370,8 +406,14 @@ def init_db(db_path: Optional[str] = None) -> None:
 
 
 def init_all_dbs() -> None:
-    """Initialize the authoritative database without inserting any seed data."""
+    """Initialize active database tables (PostgreSQL if available, SQLite authoritative db)."""
     init_db(str(resolve_db_path()))
+    if is_postgres_configured() and is_postgres_available():
+        try:
+            init_postgres_db()
+            logger.info("Authoritative PostgreSQL database schemas initialized successfully.")
+        except Exception as exc:
+            logger.error(f"Failed initializing PostgreSQL schemas: {exc}")
 
 
 def get_all_records(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -690,7 +732,7 @@ def authenticate_user(username: str, password: str, db_path: Optional[str] = Non
         cur.execute("""
             SELECT id, username, password_hash, full_name, email, role, department, permissions, is_active, created_at, last_login
             FROM users
-            WHERE username = ? COLLATE NOCASE;
+            WHERE LOWER(username) = LOWER(?);
         """, (username,))
         row = cur.fetchone()
         if not row:

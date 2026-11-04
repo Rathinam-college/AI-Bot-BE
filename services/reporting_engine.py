@@ -14,7 +14,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from database.db import resolve_db_path
+from database.db import get_connection, resolve_db_path
 
 logger = logging.getLogger("reporting_engine")
 
@@ -25,11 +25,8 @@ class ReportingEngine:
     def __init__(self):
         pass
 
-    def _get_connection(self, db_path: Optional[str] = None) -> sqlite3.Connection:
-        actual_path = str(resolve_db_path(db_path))
-        conn = sqlite3.connect(actual_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _get_connection(self, db_path: Optional[str] = None):
+        return get_connection(db_path)
 
     def get_available_months(self, db_path: Optional[str] = None) -> List[str]:
         """Detect all available YYYY-MM months present in procurement, PRs, and fuel logs."""

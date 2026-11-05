@@ -974,7 +974,10 @@ def create_chat_session(
 
 
 def list_chat_sessions(user_id: Optional[int] = None, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
-    """List recent chat sessions with message counts."""
+    """
+    List recent chat sessions strictly belonging to the given user_id.
+    Ensures private chat history per user so no user sees another user's conversations.
+    """
     conn = get_connection(db_path)
     try:
         cur = conn.cursor()
@@ -985,7 +988,7 @@ def list_chat_sessions(user_id: Optional[int] = None, db_path: Optional[str] = N
                        (SELECT content FROM chat_messages WHERE session_id = s.id ORDER BY id ASC LIMIT 1) as first_message
                 FROM chat_sessions s
                 LEFT JOIN chat_messages m ON s.id = m.session_id
-                WHERE s.user_id = ? OR s.user_id IS NULL
+                WHERE s.user_id = ?
                 GROUP BY s.id
                 ORDER BY s.updated_at DESC;
             """, (user_id,))
@@ -996,6 +999,7 @@ def list_chat_sessions(user_id: Optional[int] = None, db_path: Optional[str] = N
                        (SELECT content FROM chat_messages WHERE session_id = s.id ORDER BY id ASC LIMIT 1) as first_message
                 FROM chat_sessions s
                 LEFT JOIN chat_messages m ON s.id = m.session_id
+                WHERE s.user_id IS NULL
                 GROUP BY s.id
                 ORDER BY s.updated_at DESC;
             """)
@@ -1033,6 +1037,7 @@ def add_chat_message(
     content: str,
     model: Optional[str] = None,
     grounded_count: int = 0,
+    user_id: Optional[int] = None,
     db_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Store a message turn and update the session title if first turn."""
@@ -1042,15 +1047,17 @@ def add_chat_message(
         with conn:
             # Ensure session exists
             cur = conn.cursor()
-            cur.execute("SELECT id, title FROM chat_sessions WHERE id = ?;", (session_id,))
+            cur.execute("SELECT id, user_id, title FROM chat_sessions WHERE id = ?;", (session_id,))
             session_row = cur.fetchone()
             if not session_row:
-                # Auto-create session
+                # Auto-create session with user_id
                 title = content[:40].strip() + ("..." if len(content) > 40 else "")
                 conn.execute("""
-                    INSERT INTO chat_sessions (id, title, created_at, updated_at)
-                    VALUES (?, ?, ?, ?);
-                """, (session_id, title, now_iso, now_iso))
+                    INSERT INTO chat_sessions (id, user_id, title, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?);
+                """, (session_id, user_id, title, now_iso, now_iso))
+            elif session_row["user_id"] is None and user_id is not None:
+                conn.execute("UPDATE chat_sessions SET user_id = ? WHERE id = ?;", (user_id, session_id))
             elif session_row["title"] in ("New Chat", "Untitled Chat") and role == "user":
                 auto_title = content[:40].strip() + ("..." if len(content) > 40 else "")
                 conn.execute("UPDATE chat_sessions SET title = ?, updated_at = ? WHERE id = ?;", (auto_title, now_iso, session_id))

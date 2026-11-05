@@ -232,18 +232,29 @@ async def create_chat_session_endpoint(req: CreateSessionRequest, authorization:
 
 
 @api_router.get("/chat/sessions/{session_id}/messages")
-async def get_session_messages_endpoint(session_id: str):
-    """Retrieve full conversation messages for a chat session."""
+async def get_session_messages_endpoint(session_id: str, authorization: Optional[str] = Header(None)):
+    """Retrieve full conversation messages for a chat session strictly belonging to current user."""
     sess = get_chat_session(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="Chat session not found.")
+    user = await get_current_user_optional(authorization)
+    if sess.get("user_id") is not None:
+        if not user or (sess["user_id"] != user["id"] and user.get("role") != "admin"):
+            raise HTTPException(status_code=403, detail="Forbidden: You do not have permission to view this chat session.")
     messages = get_chat_messages(session_id)
     return {"status": "success", "session": sess, "messages": messages}
 
 
 @api_router.delete("/chat/sessions/{session_id}")
-async def delete_chat_session_endpoint(session_id: str):
-    """Delete a chat session and all its messages."""
+async def delete_chat_session_endpoint(session_id: str, authorization: Optional[str] = Header(None)):
+    """Delete a chat session strictly belonging to the current user."""
+    sess = get_chat_session(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Chat session not found.")
+    user = await get_current_user_optional(authorization)
+    if sess.get("user_id") is not None:
+        if not user or (sess["user_id"] != user["id"] and user.get("role") != "admin"):
+            raise HTTPException(status_code=403, detail="Forbidden: You cannot delete another user's chat session.")
     ok = delete_chat_session(session_id)
     return {"status": "success", "deleted": ok}
 
@@ -254,8 +265,11 @@ async def generate_session_report(session_id: str, authorization: Optional[str] 
     sess = get_chat_session(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="Chat session not found.")
-    messages = get_chat_messages(session_id)
     user = await get_current_user_optional(authorization)
+    if sess.get("user_id") is not None:
+        if not user or (sess["user_id"] != user["id"] and user.get("role") != "admin"):
+            raise HTTPException(status_code=403, detail="Forbidden: You cannot view reports for another user's conversation.")
+    messages = get_chat_messages(session_id)
     now_iso = datetime.now(timezone.utc).strftime("%B %d, %Y at %I:%M %p UTC")
 
     # Analyze conversation turns
@@ -541,16 +555,21 @@ async def process_chat_message(req: ChatRequest, authorization: Optional[str] = 
         user_id = user["id"] if user else None
         session_id = req.session_id
 
-        # Determine or create active session
+        # Determine or create active session with user isolation
         if not session_id:
             sess = create_chat_session(title=req.message[:40], user_id=user_id)
             session_id = sess["id"]
         else:
-            if not get_chat_session(session_id):
+            existing = get_chat_session(session_id)
+            if not existing:
                 create_chat_session(title=req.message[:40], user_id=user_id, session_id=session_id)
+            elif user_id and existing.get("user_id") and existing["user_id"] != user_id and user.get("role") != "admin":
+                # Isolate conversation: create a new session strictly for this user
+                sess = create_chat_session(title=req.message[:40], user_id=user_id)
+                session_id = sess["id"]
 
-        # Save user message to SQLite history
-        add_chat_message(session_id=session_id, role="user", content=req.message)
+        # Save user message to history tied to current user
+        add_chat_message(session_id=session_id, role="user", content=req.message, user_id=user_id)
 
         # Build history list if provided, or fallback to recent session history
         history_list = [{"role": h.role, "content": h.content} for h in req.history] if req.history else []
@@ -562,13 +581,14 @@ async def process_chat_message(req: ChatRequest, authorization: Optional[str] = 
 
         result = await ai_engine.answer_query(req.message, history=history_list)
 
-        # Save assistant message to SQLite history
+        # Save assistant message to history tied to current user
         add_chat_message(
             session_id=session_id,
             role="assistant",
             content=result["answer"],
             model=result.get("model"),
             grounded_count=result.get("grounded_records_count", 0),
+            user_id=user_id,
         )
 
         return ChatResponse(

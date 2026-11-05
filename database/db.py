@@ -105,10 +105,15 @@ def get_connection(db_path: Optional[str] = None):
 
 def init_db(db_path: Optional[str] = None) -> None:
     """
-    Initialize SQLite database and ensure required tables exist.
-    Starts with ZERO business records and no historical data.
+    Initialize active database schemas.
+    Calls init_postgres_db() if PostgreSQL is the active engine.
+    Otherwise initializes SQLite database with WAL mode.
     """
-    conn = get_connection(db_path)
+    if get_active_db_engine() == "postgresql" and not (db_path and "test" in str(db_path).lower()):
+        init_postgres_db()
+        return
+
+    conn = get_sqlite_connection(db_path)
     try:
         with conn:
             conn.execute("""

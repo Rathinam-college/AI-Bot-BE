@@ -117,7 +117,7 @@ class ReportingEngine:
                     row = cur.fetchone()
                     if row:
                         food_audit["procurement_line_items"] = row["cnt"]
-                        food_audit["total_procurement_spend"] = round(row["total"], 2)
+                        food_audit["total_procurement_spend"] = round(float(row["total"] or 0), 2)
 
                     # Top vendors
                     cur.execute(
@@ -131,7 +131,7 @@ class ReportingEngine:
                         (selected_month,),
                     )
                     food_audit["top_vendors"] = [
-                        {"vendor": r["vendor_name"], "items_count": r["items"], "amount": round(r["total_val"], 2)}
+                        {"vendor": r["vendor_name"], "items_count": r["items"], "amount": round(float(r["total_val"] or 0), 2)}
                         for r in cur.fetchall()
                     ]
 
@@ -141,13 +141,13 @@ class ReportingEngine:
                         SELECT item_name, COALESCE(unit, 'Units') as unit, COALESCE(SUM(quantity), 0.0) as qty, COALESCE(SUM(total_price), 0.0) as total_val
                         FROM food_procurement
                         WHERE substr(purchase_date, 1, 7) = ? AND item_name IS NOT NULL AND item_name != ''
-                        GROUP BY item_name
+                        GROUP BY item_name, unit
                         ORDER BY total_val DESC LIMIT 6;
                         """,
                         (selected_month,),
                     )
                     food_audit["top_commodities"] = [
-                        {"item": r["item_name"], "unit": r["unit"], "quantity": round(r["qty"], 1), "amount": round(r["total_val"], 2)}
+                        {"item": r["item_name"], "unit": r["unit"], "quantity": round(r["qty"], 1), "amount": round(float(r["total_val"] or 0), 2)}
                         for r in cur.fetchall()
                     ]
                 except Exception as exc:
@@ -166,7 +166,7 @@ class ReportingEngine:
                     pr_row = cur.fetchone()
                     if pr_row:
                         food_audit["prs_count"] = pr_row["cnt"]
-                        food_audit["total_prs_amount"] = round(pr_row["total"], 2)
+                        food_audit["total_prs_amount"] = round(float(pr_row["total"] or 0), 2)
 
                     cur.execute(
                         """
@@ -210,11 +210,11 @@ class ReportingEngine:
                     f_row = cur.fetchone()
                     if f_row and f_row["cnt"]:
                         transport_audit["fuel_logs_count"] = f_row["cnt"]
-                        transport_audit["total_fuel_spend"] = round(f_row["total_amt"], 2)
-                        transport_audit["total_fuel_liters"] = round(f_row["total_liters"], 1)
-                        transport_audit["total_fleet_km"] = round(f_row["total_km"], 1)
-                        if f_row["total_liters"] > 0:
-                            transport_audit["avg_cost_per_liter"] = round(f_row["total_amt"] / f_row["total_liters"], 2)
+                        transport_audit["total_fuel_spend"] = round(float(f_row["total_amt"] or 0), 2)
+                        transport_audit["total_fuel_liters"] = round(float(f_row["total_liters"] or 0), 1)
+                        transport_audit["total_fleet_km"] = round(float(f_row["total_km"] or 0), 1)
+                        if float(f_row["total_liters"] or 0) > 0:
+                            transport_audit["avg_cost_per_liter"] = round(float(f_row["total_amt"]) / float(f_row["total_liters"]), 2)
 
                     # Vehicle breakdown
                     cur.execute(
@@ -228,7 +228,7 @@ class ReportingEngine:
                         (selected_month,),
                     )
                     transport_audit["vehicles_fuel_breakdown"] = [
-                        {"vehicle": r["vehicle_number"], "logs": r["logs"], "amount": round(r["total_amt"], 2), "liters": round(r["liters"], 1)}
+                        {"vehicle": r["vehicle_number"], "logs": r["logs"], "amount": round(float(r["total_amt"] or 0), 2), "liters": round(float(r["liters"] or 0), 1)}
                         for r in cur.fetchall()
                     ]
 
@@ -243,7 +243,7 @@ class ReportingEngine:
                     )
                     ren_row = cur.fetchone()
                     if ren_row:
-                        transport_audit["renewals_spend"] = round(ren_row["total_ren"], 2)
+                        transport_audit["renewals_spend"] = round(float(ren_row["total_ren"] or 0), 2)
                 except Exception as exc:
                     logger.warning(f"Error reading transport in audit: {exc}")
 
@@ -287,9 +287,9 @@ class ReportingEngine:
             # 4. OVERALL EXECUTIVE METRICS CONSOLIDATION
             # -------------------------------------------------------------
             total_spend = round(
-                food_audit["total_procurement_spend"]
-                + transport_audit["total_fuel_spend"]
-                + transport_audit["renewals_spend"],
+                float(food_audit["total_procurement_spend"] or 0)
+                + float(transport_audit["total_fuel_spend"] or 0)
+                + float(transport_audit["renewals_spend"] or 0),
                 2,
             )
 
@@ -322,7 +322,7 @@ class ReportingEngine:
                     "total_line_items": food_audit["procurement_line_items"] + transport_audit["fuel_logs_count"],
                     "department_spending": {
                         "Food": food_audit["total_procurement_spend"],
-                        "Transport": round(transport_audit["total_fuel_spend"] + transport_audit["renewals_spend"], 2),
+                        "Transport": round(float(transport_audit["total_fuel_spend"] or 0) + float(transport_audit["renewals_spend"] or 0), 2),
                         "CCTV": 0.0,
                     },
                     "campus_operational_health_score": health_score,

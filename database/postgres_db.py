@@ -10,6 +10,15 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Ensure .env is loaded
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if (_PROJECT_ROOT / ".env").exists():
+    load_dotenv(dotenv_path=_PROJECT_ROOT / ".env", override=True)
+load_dotenv(override=False)
+
 import psycopg2
 from psycopg2.extras import DictCursor
 
@@ -93,12 +102,15 @@ class PostgresCursorWrapper:
     def execute(self, query: str, params: Any = None):
         if params is not None:
             pg_query = query.replace("?", "%s")
-            return self._cur.execute(pg_query, params)
-        return self._cur.execute(query)
+            self._cur.execute(pg_query, params)
+        else:
+            self._cur.execute(query)
+        return self
 
     def executemany(self, query: str, seq_of_params: Any):
         pg_query = query.replace("?", "%s")
-        return self._cur.executemany(pg_query, seq_of_params)
+        self._cur.executemany(pg_query, seq_of_params)
+        return self
 
     def fetchone(self):
         return self._cur.fetchone()

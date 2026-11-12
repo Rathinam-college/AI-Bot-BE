@@ -1,3 +1,4 @@
+
 """
 Automated SQLite to PostgreSQL Migration Tool for Server AI Assistant.
 Extracts all campus intelligence records, user accounts, chat sessions,
